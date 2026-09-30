@@ -123,6 +123,17 @@ impl UdpIo {
     }
 }
 
+/// Splits the first `len` bytes of a receive buffer into its datagrams.
+///
+/// Datagrams start every `stride` bytes, and the last one may be shorter, as
+/// the kernel builds GRO batches. noq-udp reports `stride == len` without GRO,
+/// so a stride of zero only occurs for an empty receive; it is treated as one
+/// datagram rather than looping forever.
+fn datagrams(batch: &[u8], len: usize, stride: usize) -> impl Iterator<Item = &[u8]> {
+    let stride = if stride == 0 { len.max(1) } else { stride };
+    batch[..len].chunks(stride)
+}
+
 // ---------------------------------------------------------------------------
 // KrpcSocket – KRPC message framing on top of UdpIo
 // ---------------------------------------------------------------------------
@@ -311,9 +322,7 @@ impl KrpcSocket {
         };
         // Taken out so each datagram can be handled with `&mut self`.
         let batch = std::mem::take(&mut self.io.batch);
-        let stride = if stride == 0 { len.max(1) } else { stride };
-        let messages = batch[..len]
-            .chunks(stride)
+        let messages = datagrams(&batch, len, stride)
             .filter_map(|bytes| self.handle_datagram(bytes, from))
             .collect();
         self.io.batch = batch;
@@ -838,9 +847,9 @@ mod test {
         let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let state = noq_udp::UdpSocketState::new((&sender).into()).unwrap();
         // Equal-sized datagrams, and a shorter last one, as GRO allows.
-        let datagrams = [vec![1u8; 100], vec![2; 100], vec![3; 40]];
+        let sent = [vec![1u8; 100], vec![2; 100], vec![3; 40]];
         if state.max_gso_segments().get() > 1 {
-            let contents = datagrams.concat();
+            let contents = sent.concat();
             let transmit = noq_udp::Transmit {
                 destination,
                 ecn: None,
@@ -850,24 +859,43 @@ mod test {
             };
             state.send((&sender).into(), &transmit).unwrap();
         } else {
-            for datagram in &datagrams {
+            for datagram in &sent {
                 sender.send_to(datagram, destination).unwrap();
             }
         }
         let mut received = Vec::new();
-        while received.len() < datagrams.len() {
+        while received.len() < sent.len() {
             let (from, len, stride) =
                 tokio::time::timeout(Duration::from_secs(5), receiver.recv_batch())
                     .await
                     .expect("datagrams in time")
                     .unwrap();
             assert_eq!(from, sender.local_addr().unwrap());
-            received.extend(
-                receiver.batch[..len]
-                    .chunks(stride.max(1))
-                    .map(<[u8]>::to_vec),
-            );
+            received.extend(datagrams(&receiver.batch, len, stride).map(<[u8]>::to_vec));
         }
-        assert_eq!(received, datagrams);
+        assert_eq!(received, sent);
+    }
+
+    #[test]
+    fn datagrams_split_at_the_stride() {
+        let batch: Vec<u8> = (0..=255u8).cycle().take(300).collect();
+        let lengths = |len, stride| {
+            datagrams(&batch, len, stride)
+                .map(<[u8]>::len)
+                .collect::<Vec<_>>()
+        };
+        // Equal segments, and a shorter last one.
+        assert_eq!(lengths(300, 100), vec![100, 100, 100]);
+        assert_eq!(lengths(240, 100), vec![100, 100, 40]);
+        // Without GRO, noq-udp reports the length as the stride.
+        assert_eq!(lengths(57, 57), vec![57]);
+        // A stride longer than the data is one datagram.
+        assert_eq!(lengths(57, 100), vec![57]);
+        // An empty receive yields nothing, and a zero stride does not loop.
+        assert_eq!(lengths(0, 0), Vec::<usize>::new());
+        assert_eq!(lengths(57, 0), vec![57]);
+        // Datagrams are the right bytes, in order.
+        let parts: Vec<&[u8]> = datagrams(&batch, 5, 2).collect();
+        assert_eq!(parts, vec![&[0, 1][..], &[2, 3][..], &[4][..]]);
     }
 }
