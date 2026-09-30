@@ -42,6 +42,8 @@ const LEGACY_VERSION: [u8; 4] = [82, 83, 0, 5]; // "RS" version 05
 struct UdpIo {
     socket: UdpSocket,
     state: noq_udp::UdpSocketState,
+    /// Receive buffer, large enough for a whole GRO batch.
+    batch: Box<[u8]>,
 }
 
 impl UdpIo {
@@ -50,7 +52,13 @@ impl UdpIo {
         let std_socket = std::net::UdpSocket::bind(addr)?;
         let state = noq_udp::UdpSocketState::new((&std_socket).into())?;
         let socket = UdpSocket::from_std(std_socket)?;
-        Ok(Self { socket, state })
+        // With GRO, one receive can return up to `gro_segments` datagrams.
+        let batch = vec![0; MTU * state.gro_segments().get()].into_boxed_slice();
+        Ok(Self {
+            socket,
+            state,
+            batch,
+        })
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -79,12 +87,15 @@ impl UdpIo {
         }
     }
 
-    /// Receive one datagram. Waits for readability, then calls
-    /// noq-udp `recvmsg`.
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    /// Receive one batch into `batch`: every datagram of a single `recvmsg`.
+    ///
+    /// Usually one datagram. With GRO the kernel can coalesce several from the
+    /// same sender. Returns the sender, the total length and the stride: the
+    /// datagrams start every `stride` bytes, and the last one may be shorter.
+    async fn recv_batch(&mut self) -> io::Result<(SocketAddr, usize, usize)> {
         loop {
             self.socket.readable().await?;
-            match self.try_recv(buf) {
+            match self.try_recv() {
                 Ok(result) => return Ok(result),
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(e),
@@ -93,20 +104,34 @@ impl UdpIo {
     }
 
     /// Non-blocking receive attempt via `try_io` + noq-udp `recvmsg`.
-    fn try_recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.socket.try_io(Interest::READABLE, || {
-            let mut iov = [IoSliceMut::new(buf)];
+    fn try_recv(&mut self) -> io::Result<(SocketAddr, usize, usize)> {
+        let Self {
+            socket,
+            state,
+            batch,
+        } = self;
+        socket.try_io(Interest::READABLE, || {
+            let mut iov = [IoSliceMut::new(batch)];
             let mut meta = [noq_udp::RecvMeta::default()];
-            let n = self
-                .state
-                .recv((&self.socket).into(), &mut iov, &mut meta)?;
+            let n = state.recv((&*socket).into(), &mut iov, &mut meta)?;
             if n > 0 {
-                Ok((meta[0].len, meta[0].addr))
+                Ok((meta[0].addr, meta[0].len, meta[0].stride))
             } else {
                 Err(io::Error::new(ErrorKind::WouldBlock, "no data"))
             }
         })
     }
+}
+
+/// Splits the first `len` bytes of a receive buffer into its datagrams.
+///
+/// Datagrams start every `stride` bytes, and the last one may be shorter, as
+/// the kernel builds GRO batches. noq-udp reports `stride == len` without GRO,
+/// so a stride of zero only occurs for an empty receive; it is treated as one
+/// datagram rather than looping forever.
+fn datagrams(batch: &[u8], len: usize, stride: usize) -> impl Iterator<Item = &[u8]> {
+    let stride = if stride == 0 { len.max(1) } else { stride };
+    batch[..len].chunks(stride)
 }
 
 // ---------------------------------------------------------------------------
@@ -275,92 +300,107 @@ impl KrpcSocket {
         self.datagram_hook = hook;
     }
 
-    /// Async receive: waits for a datagram and returns a parsed KRPC message.
-    pub async fn recv_from(&mut self) -> Option<(Message, SocketAddrV4)> {
-        let mut buf = [0u8; MTU];
-
+    /// Async receive: waits for one batch of datagrams and returns the KRPC
+    /// messages among them.
+    ///
+    /// A batch is usually one datagram. With GRO it can be several from the
+    /// same sender, and all of them are handled. Cancel safe: everything after
+    /// the receive itself is synchronous.
+    pub async fn recv_batch(&mut self) -> Vec<(Message, SocketAddrV4)> {
         self.inflight_requests.cleanup();
 
-        match self.io.recv_from(&mut buf).await {
-            Ok((amt, SocketAddr::V4(from))) => {
-                let bytes = &buf[..amt];
-
-                if from.port() == 0 {
-                    trace!(
-                        context = "socket_validation",
-                        message = "Response from port 0"
-                    );
-                    return None;
-                }
-
-                if self
-                    .datagram_hook
-                    .as_mut()
-                    .is_some_and(|hook| hook.accept(bytes, from))
-                {
-                    return None;
-                }
-
-                match Message::from_bytes(bytes) {
-                    Ok(message) => {
-                        // Parsed correctly.
-                        let should_return = match message.message_type {
-                            MessageType::Request(ref _request_specific) => {
-                                // simulate legacy nodes not supporting `announce_signed_peers` and `get_signed_peers`
-                                #[cfg(test)]
-                                let should_return =
-                                    supports_request(&self.version, _request_specific);
-                                #[cfg(not(test))]
-                                let should_return = true;
-
-                                trace!(
-                                    context = "socket_message_receiving",
-                                    ?message,
-                                    ?from,
-                                    "Received request message"
-                                );
-
-                                should_return
-                            }
-                            MessageType::Response(_) => {
-                                trace!(
-                                    context = "socket_message_receiving",
-                                    ?message,
-                                    ?from,
-                                    "Received response message"
-                                );
-
-                                self.is_expected_response(&message, &from)
-                            }
-                            MessageType::Error(_) => {
-                                trace!(
-                                    context = "socket_message_receiving",
-                                    ?message,
-                                    ?from,
-                                    "Received error message"
-                                );
-
-                                self.is_expected_response(&message, &from)
-                            }
-                        };
-
-                        if should_return {
-                            return Some((message, from));
-                        }
-                    }
-                    Err(error) => {
-                        trace!(context = "socket_error", ?error, ?from, message = ?String::from_utf8_lossy(bytes), "Received invalid Bencode message.");
-                    }
-                };
-            }
-            Ok((_, SocketAddr::V6(_))) => {
-                // Ignore unsupported Ipv6 messages
-            }
+        let (from, len, stride) = match self.io.recv_batch().await {
+            Ok(received) => received,
             Err(error) => {
-                warn!("IO error {error}")
+                warn!("IO error {error}");
+                return Vec::new();
             }
         };
+        let SocketAddr::V4(from) = from else {
+            // Ignore unsupported Ipv6 messages
+            return Vec::new();
+        };
+        // Taken out so each datagram can be handled with `&mut self`.
+        let batch = std::mem::take(&mut self.io.batch);
+        let messages = datagrams(&batch, len, stride)
+            .filter_map(|bytes| self.handle_datagram(bytes, from))
+            .collect();
+        self.io.batch = batch;
+        messages
+    }
 
+    /// Passes one datagram to the hook, or parses it as a KRPC message.
+    fn handle_datagram(
+        &mut self,
+        bytes: &[u8],
+        from: SocketAddrV4,
+    ) -> Option<(Message, SocketAddrV4)> {
+        if from.port() == 0 {
+            trace!(
+                context = "socket_validation",
+                message = "Response from port 0"
+            );
+            return None;
+        }
+
+        if self
+            .datagram_hook
+            .as_mut()
+            .is_some_and(|hook| hook.accept(bytes, from))
+        {
+            return None;
+        }
+
+        match Message::from_bytes(bytes) {
+            Ok(message) => {
+                // Parsed correctly.
+                let should_return = match message.message_type {
+                    MessageType::Request(ref _request_specific) => {
+                        // simulate legacy nodes not supporting `announce_signed_peers` and `get_signed_peers`
+                        #[cfg(test)]
+                        let should_return = supports_request(&self.version, _request_specific);
+                        #[cfg(not(test))]
+                        let should_return = true;
+
+                        trace!(
+                            context = "socket_message_receiving",
+                            ?message,
+                            ?from,
+                            "Received request message"
+                        );
+
+                        should_return
+                    }
+                    MessageType::Response(_) => {
+                        trace!(
+                            context = "socket_message_receiving",
+                            ?message,
+                            ?from,
+                            "Received response message"
+                        );
+
+                        self.is_expected_response(&message, &from)
+                    }
+                    MessageType::Error(_) => {
+                        trace!(
+                            context = "socket_message_receiving",
+                            ?message,
+                            ?from,
+                            "Received error message"
+                        );
+
+                        self.is_expected_response(&message, &from)
+                    }
+                };
+
+                if should_return {
+                    return Some((message, from));
+                }
+            }
+            Err(error) => {
+                trace!(context = "socket_error", ?error, ?from, message = ?String::from_utf8_lossy(bytes), "Received invalid Bencode message.");
+            }
+        };
         None
     }
 
@@ -671,7 +711,7 @@ mod test {
         client.flush().await;
 
         let (message, from) = loop {
-            if let Some(result) = server.recv_from().await {
+            if let Some(result) = server.recv_batch().await.into_iter().next() {
                 break result;
             }
         };
@@ -703,7 +743,7 @@ mod test {
         );
         client.flush().await;
 
-        assert!(server.recv_from().await.is_none());
+        assert!(server.recv_batch().await.is_empty());
         let (bytes, _) = receiver.recv().await.unwrap();
         assert!(Message::from_bytes(&bytes).is_ok());
     }
@@ -729,7 +769,7 @@ mod test {
         client.flush().await;
 
         let (message, from) = loop {
-            if let Some(result) = server.recv_from().await {
+            if let Some(result) = server.recv_batch().await.into_iter().next() {
                 break result;
             }
         };
@@ -769,10 +809,10 @@ mod test {
         client.flush().await;
 
         // Use a timeout to avoid hanging - recv should not return a valid response
-        let result = tokio::time::timeout(Duration::from_millis(50), server.recv_from()).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), server.recv_batch()).await;
 
         assert!(
-            result.is_err() || result.unwrap().is_none(),
+            result.is_err() || result.unwrap().is_empty(),
             "Should not receive a response from wrong address"
         );
     }
@@ -793,5 +833,69 @@ mod test {
         tokio::time::sleep(server.inflight_requests.request_timeout()).await;
 
         assert!(!server.inflight(&tid));
+    }
+
+    /// Datagrams that arrive in one GRO batch are handed out one by one.
+    ///
+    /// Where the sender supports GSO (Linux), one segmented send over loopback
+    /// reaches the receiver as a single GRO batch. Elsewhere the datagrams are
+    /// sent separately, which checks the path without GRO.
+    #[tokio::test]
+    async fn gro_batches_are_split_into_datagrams() {
+        let mut receiver = UdpIo::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let state = noq_udp::UdpSocketState::new((&sender).into()).unwrap();
+        // Equal-sized datagrams, and a shorter last one, as GRO allows.
+        let sent = [vec![1u8; 100], vec![2; 100], vec![3; 40]];
+        if state.max_gso_segments().get() > 1 {
+            let contents = sent.concat();
+            let transmit = noq_udp::Transmit {
+                destination,
+                ecn: None,
+                contents: &contents,
+                segment_size: Some(100),
+                src_ip: None,
+            };
+            state.send((&sender).into(), &transmit).unwrap();
+        } else {
+            for datagram in &sent {
+                sender.send_to(datagram, destination).unwrap();
+            }
+        }
+        let mut received = Vec::new();
+        while received.len() < sent.len() {
+            let (from, len, stride) =
+                tokio::time::timeout(Duration::from_secs(5), receiver.recv_batch())
+                    .await
+                    .expect("datagrams in time")
+                    .unwrap();
+            assert_eq!(from, sender.local_addr().unwrap());
+            received.extend(datagrams(&receiver.batch, len, stride).map(<[u8]>::to_vec));
+        }
+        assert_eq!(received, sent);
+    }
+
+    #[test]
+    fn datagrams_split_at_the_stride() {
+        let batch: Vec<u8> = (0..=255u8).cycle().take(300).collect();
+        let lengths = |len, stride| {
+            datagrams(&batch, len, stride)
+                .map(<[u8]>::len)
+                .collect::<Vec<_>>()
+        };
+        // Equal segments, and a shorter last one.
+        assert_eq!(lengths(300, 100), vec![100, 100, 100]);
+        assert_eq!(lengths(240, 100), vec![100, 100, 40]);
+        // Without GRO, noq-udp reports the length as the stride.
+        assert_eq!(lengths(57, 57), vec![57]);
+        // A stride longer than the data is one datagram.
+        assert_eq!(lengths(57, 100), vec![57]);
+        // An empty receive yields nothing, and a zero stride does not loop.
+        assert_eq!(lengths(0, 0), Vec::<usize>::new());
+        assert_eq!(lengths(57, 0), vec![57]);
+        // Datagrams are the right bytes, in order.
+        let parts: Vec<&[u8]> = datagrams(&batch, 5, 2).collect();
+        assert_eq!(parts, vec![&[0, 1][..], &[2, 3][..], &[4][..]]);
     }
 }
