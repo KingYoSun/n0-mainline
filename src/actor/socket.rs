@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::io::{self, ErrorKind, IoSliceMut};
 use std::net::{SocketAddr, SocketAddrV4};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
@@ -42,6 +43,10 @@ const LEGACY_VERSION: [u8; 4] = [82, 83, 0, 5]; // "RS" version 05
 struct UdpIo {
     socket: UdpSocket,
     state: noq_udp::UdpSocketState,
+    /// Receive buffer, large enough for a whole GRO batch.
+    batch: Box<[u8]>,
+    /// Datagrams of the last batch not handed out yet, as ranges into `batch`.
+    pending: VecDeque<(Range<usize>, SocketAddr)>,
 }
 
 impl UdpIo {
@@ -50,7 +55,14 @@ impl UdpIo {
         let std_socket = std::net::UdpSocket::bind(addr)?;
         let state = noq_udp::UdpSocketState::new((&std_socket).into())?;
         let socket = UdpSocket::from_std(std_socket)?;
-        Ok(Self { socket, state })
+        // With GRO, one receive can return up to `gro_segments` datagrams.
+        let batch = vec![0; MTU * state.gro_segments().get()].into_boxed_slice();
+        Ok(Self {
+            socket,
+            state,
+            batch,
+            pending: VecDeque::new(),
+        })
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -79,32 +91,63 @@ impl UdpIo {
         }
     }
 
-    /// Receive one datagram. Waits for readability, then calls
-    /// noq-udp `recvmsg`.
-    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    /// Receive one datagram into `buf`, truncated to fit.
+    ///
+    /// With GRO the kernel can deliver several datagrams from one sender in a
+    /// single receive. They are split at the stride and handed out one per
+    /// call; queued ones are returned without waiting for the socket.
+    ///
+    /// Cancel safe: a batch is queued in the same poll it is received in.
+    async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
+            if let Some((range, from)) = self.pending.pop_front() {
+                let len = range.len().min(buf.len());
+                buf[..len].copy_from_slice(&self.batch[range.start..range.start + len]);
+                return Ok((len, from));
+            }
             self.socket.readable().await?;
-            match self.try_recv(buf) {
-                Ok(result) => return Ok(result),
+            match self.try_recv() {
+                Ok(()) => continue,
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(e),
             }
         }
     }
 
-    /// Non-blocking receive attempt via `try_io` + noq-udp `recvmsg`.
-    fn try_recv(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.socket.try_io(Interest::READABLE, || {
-            let mut iov = [IoSliceMut::new(buf)];
+    /// Non-blocking receive of one batch via `try_io` + noq-udp `recvmsg`,
+    /// queued as individual datagrams.
+    fn try_recv(&mut self) -> io::Result<()> {
+        let Self {
+            socket,
+            state,
+            batch,
+            pending,
+        } = self;
+        socket.try_io(Interest::READABLE, || {
+            let mut iov = [IoSliceMut::new(batch)];
             let mut meta = [noq_udp::RecvMeta::default()];
-            let n = self
-                .state
-                .recv((&self.socket).into(), &mut iov, &mut meta)?;
-            if n > 0 {
-                Ok((meta[0].len, meta[0].addr))
-            } else {
-                Err(io::Error::new(ErrorKind::WouldBlock, "no data"))
+            let n = state.recv((&*socket).into(), &mut iov, &mut meta)?;
+            if n == 0 {
+                return Err(io::Error::new(ErrorKind::WouldBlock, "no data"));
             }
+            let meta = &meta[0];
+            if meta.len == 0 {
+                pending.push_back((0..0, meta.addr));
+                return Ok(());
+            }
+            // Datagrams start at every stride; the last one may be shorter.
+            let stride = if meta.stride == 0 {
+                meta.len
+            } else {
+                meta.stride
+            };
+            let mut start = 0;
+            while start < meta.len {
+                let end = (start + stride).min(meta.len);
+                pending.push_back((start..end, meta.addr));
+                start = end;
+            }
+            Ok(())
         })
     }
 }
@@ -793,5 +836,45 @@ mod test {
         tokio::time::sleep(server.inflight_requests.request_timeout()).await;
 
         assert!(!server.inflight(&tid));
+    }
+
+    /// Datagrams that arrive in one GRO batch are handed out one by one.
+    ///
+    /// Where the sender supports GSO (Linux), one segmented send over loopback
+    /// reaches the receiver as a single GRO batch. Elsewhere the datagrams are
+    /// sent separately, which checks the path without GRO.
+    #[tokio::test]
+    async fn gro_batches_are_split_into_datagrams() {
+        let mut receiver = UdpIo::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let state = noq_udp::UdpSocketState::new((&sender).into()).unwrap();
+        // Equal-sized datagrams, and a shorter last one, as GRO allows.
+        let datagrams = [vec![1u8; 100], vec![2; 100], vec![3; 40]];
+        if state.max_gso_segments().get() > 1 {
+            let contents = datagrams.concat();
+            let transmit = noq_udp::Transmit {
+                destination,
+                ecn: None,
+                contents: &contents,
+                segment_size: Some(100),
+                src_ip: None,
+            };
+            state.send((&sender).into(), &transmit).unwrap();
+        } else {
+            for datagram in &datagrams {
+                sender.send_to(datagram, destination).unwrap();
+            }
+        }
+        let mut buf = [0u8; MTU];
+        for expected in &datagrams {
+            let (len, from) =
+                tokio::time::timeout(Duration::from_secs(5), receiver.recv_from(&mut buf))
+                    .await
+                    .expect("datagram in time")
+                    .unwrap();
+            assert_eq!(from, sender.local_addr().unwrap());
+            assert_eq!(&buf[..len], &expected[..]);
+        }
     }
 }
