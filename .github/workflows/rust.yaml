@@ -6,26 +6,32 @@ on:
   pull_request:
     branches: [ main ]
 
+# Default to read-only; jobs that need more grant it explicitly.
 permissions:
-  contents: write
+  contents: read
+
+env:
+  NEXTEST_VERSION: "0.9.80"
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v2
-
-    - name: Set up Rust
-      uses: actions-rs/toolchain@v1
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       with:
-        profile: minimal
+        persist-credentials: false
+
+    # actions-rs was archived in 2023 and its runner is too old for current
+    # runners; rust-toolchain.toml already pins the channel.
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      with:
         toolchain: stable
         components: rustfmt, clippy
-        override: true
 
     - name: Cache cargo registry
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.cargo/registry
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -33,7 +39,7 @@ jobs:
           ${{ runner.os }}-cargo-registry-
 
     - name: Cache cargo index
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
@@ -42,24 +48,19 @@ jobs:
 
     - name: Cache cargo build
       id: cargo-build-cache
-      uses: actions/cache@v4
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: target
         key: ${{ runner.os }}-cargo-build-${{ hashFiles('./Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-build-
 
-    - name: Cache Nextest installation
-      uses: actions/cache@v4
+    # Was a cargo install behind a cache keyed only on the OS, so whatever
+    # binary landed there first was reused forever, unversioned.
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
       with:
-        path: ~/.cargo/bin/cargo-nextest
-        key: ${{ runner.os }}-cargo-nextest
-
-    - name: Install Nextest if not cached
-      run: |
-        if [ ! -f ~/.cargo/bin/cargo-nextest ]; then
-          cargo install cargo-nextest --locked
-        fi
+        tool: nextest@${{ env.NEXTEST_VERSION }}
 
     - name: Check formatting
       id: fmt
@@ -67,17 +68,17 @@ jobs:
       continue-on-error: true
 
     - name: Lint with Clippy
-      run: cargo clippy --workspace --bins --tests -- -D warnings
+      run: cargo clippy --locked --workspace --bins --tests -- -D warnings
 
     - name: Build
       if: steps.cargo-build-cache.outputs.cache-hit != 'true'
-      run: cargo build --release --workspace --verbose
+      run: cargo build --locked --release --workspace --verbose
 
     - name: Run tests with Nextest
-      run: cargo nextest run --workspace --verbose
+      run: cargo nextest run --locked --workspace --verbose
 
     - name: Run docs
-      run: cargo doc --workspace --no-deps --document-private-items --verbose
+      run: cargo doc --locked --workspace --no-deps --document-private-items --verbose
 
     - name: Fail if formatting check failed
       if: steps.fmt.outcome == 'failure'
@@ -86,19 +87,31 @@ jobs:
   minimal-versions:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: dtolnay/rust-toolchain@nightly
-    - uses: dtolnay/rust-toolchain@stable
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        persist-credentials: false
+    - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      with:
+        toolchain: nightly
+    - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      with:
+        toolchain: stable
+    # No --locked on the update: re-resolving is the point, so
+    # -Z min-publish-age guards the versions the lockfile has never seen.
     - name: Resolve to minimum versions
-      run: cargo +nightly -Z minimal-versions update
+      run: |
+        cargo +nightly -Z minimal-versions -Z min-publish-age update \
+          --config 'registry.global-min-publish-age="3 days"'
     - name: Check lib at minimum versions
       run: cargo check --lib --locked
 
   cargo-deny:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: EmbarkStudios/cargo-deny-action@v2
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        persist-credentials: false
+    - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
       with:
         command: check
         arguments: --workspace --all-features
