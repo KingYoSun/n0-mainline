@@ -451,8 +451,8 @@ pub(crate) async fn run(mut actor: Actor, mut receiver: mpsc::Receiver<ActorMess
                     }
                 }
             }
-            packet = actor.socket.recv_from() => {
-                if let Some((message, from)) = packet {
+            messages = actor.socket.recv_batch() => {
+                for (message, from) in messages {
                     actor.process_message(message, from);
                 }
             }

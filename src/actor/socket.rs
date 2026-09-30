@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::io::{self, ErrorKind, IoSliceMut};
 use std::net::{SocketAddr, SocketAddrV4};
-use std::ops::Range;
 use std::time::{Duration, Instant};
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
@@ -45,8 +44,6 @@ struct UdpIo {
     state: noq_udp::UdpSocketState,
     /// Receive buffer, large enough for a whole GRO batch.
     batch: Box<[u8]>,
-    /// Datagrams of the last batch not handed out yet, as ranges into `batch`.
-    pending: VecDeque<(Range<usize>, SocketAddr)>,
 }
 
 impl UdpIo {
@@ -61,7 +58,6 @@ impl UdpIo {
             socket,
             state,
             batch,
-            pending: VecDeque::new(),
         })
     }
 
@@ -91,63 +87,38 @@ impl UdpIo {
         }
     }
 
-    /// Receive one datagram into `buf`, truncated to fit.
+    /// Receive one batch into `batch`: every datagram of a single `recvmsg`.
     ///
-    /// With GRO the kernel can deliver several datagrams from one sender in a
-    /// single receive. They are split at the stride and handed out one per
-    /// call; queued ones are returned without waiting for the socket.
-    ///
-    /// Cancel safe: a batch is queued in the same poll it is received in.
-    async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    /// Usually one datagram. With GRO the kernel can coalesce several from the
+    /// same sender. Returns the sender, the total length and the stride: the
+    /// datagrams start every `stride` bytes, and the last one may be shorter.
+    async fn recv_batch(&mut self) -> io::Result<(SocketAddr, usize, usize)> {
         loop {
-            if let Some((range, from)) = self.pending.pop_front() {
-                let len = range.len().min(buf.len());
-                buf[..len].copy_from_slice(&self.batch[range.start..range.start + len]);
-                return Ok((len, from));
-            }
             self.socket.readable().await?;
             match self.try_recv() {
-                Ok(()) => continue,
+                Ok(result) => return Ok(result),
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,
                 Err(e) => return Err(e),
             }
         }
     }
 
-    /// Non-blocking receive of one batch via `try_io` + noq-udp `recvmsg`,
-    /// queued as individual datagrams.
-    fn try_recv(&mut self) -> io::Result<()> {
+    /// Non-blocking receive attempt via `try_io` + noq-udp `recvmsg`.
+    fn try_recv(&mut self) -> io::Result<(SocketAddr, usize, usize)> {
         let Self {
             socket,
             state,
             batch,
-            pending,
         } = self;
         socket.try_io(Interest::READABLE, || {
             let mut iov = [IoSliceMut::new(batch)];
             let mut meta = [noq_udp::RecvMeta::default()];
             let n = state.recv((&*socket).into(), &mut iov, &mut meta)?;
-            if n == 0 {
-                return Err(io::Error::new(ErrorKind::WouldBlock, "no data"));
-            }
-            let meta = &meta[0];
-            if meta.len == 0 {
-                pending.push_back((0..0, meta.addr));
-                return Ok(());
-            }
-            // Datagrams start at every stride; the last one may be shorter.
-            let stride = if meta.stride == 0 {
-                meta.len
+            if n > 0 {
+                Ok((meta[0].addr, meta[0].len, meta[0].stride))
             } else {
-                meta.stride
-            };
-            let mut start = 0;
-            while start < meta.len {
-                let end = (start + stride).min(meta.len);
-                pending.push_back((start..end, meta.addr));
-                start = end;
+                Err(io::Error::new(ErrorKind::WouldBlock, "no data"))
             }
-            Ok(())
         })
     }
 }
@@ -318,92 +289,109 @@ impl KrpcSocket {
         self.datagram_hook = hook;
     }
 
-    /// Async receive: waits for a datagram and returns a parsed KRPC message.
-    pub async fn recv_from(&mut self) -> Option<(Message, SocketAddrV4)> {
-        let mut buf = [0u8; MTU];
-
+    /// Async receive: waits for one batch of datagrams and returns the KRPC
+    /// messages among them.
+    ///
+    /// A batch is usually one datagram. With GRO it can be several from the
+    /// same sender, and all of them are handled. Cancel safe: everything after
+    /// the receive itself is synchronous.
+    pub async fn recv_batch(&mut self) -> Vec<(Message, SocketAddrV4)> {
         self.inflight_requests.cleanup();
 
-        match self.io.recv_from(&mut buf).await {
-            Ok((amt, SocketAddr::V4(from))) => {
-                let bytes = &buf[..amt];
-
-                if from.port() == 0 {
-                    trace!(
-                        context = "socket_validation",
-                        message = "Response from port 0"
-                    );
-                    return None;
-                }
-
-                if self
-                    .datagram_hook
-                    .as_mut()
-                    .is_some_and(|hook| hook.accept(bytes, from))
-                {
-                    return None;
-                }
-
-                match Message::from_bytes(bytes) {
-                    Ok(message) => {
-                        // Parsed correctly.
-                        let should_return = match message.message_type {
-                            MessageType::Request(ref _request_specific) => {
-                                // simulate legacy nodes not supporting `announce_signed_peers` and `get_signed_peers`
-                                #[cfg(test)]
-                                let should_return =
-                                    supports_request(&self.version, _request_specific);
-                                #[cfg(not(test))]
-                                let should_return = true;
-
-                                trace!(
-                                    context = "socket_message_receiving",
-                                    ?message,
-                                    ?from,
-                                    "Received request message"
-                                );
-
-                                should_return
-                            }
-                            MessageType::Response(_) => {
-                                trace!(
-                                    context = "socket_message_receiving",
-                                    ?message,
-                                    ?from,
-                                    "Received response message"
-                                );
-
-                                self.is_expected_response(&message, &from)
-                            }
-                            MessageType::Error(_) => {
-                                trace!(
-                                    context = "socket_message_receiving",
-                                    ?message,
-                                    ?from,
-                                    "Received error message"
-                                );
-
-                                self.is_expected_response(&message, &from)
-                            }
-                        };
-
-                        if should_return {
-                            return Some((message, from));
-                        }
-                    }
-                    Err(error) => {
-                        trace!(context = "socket_error", ?error, ?from, message = ?String::from_utf8_lossy(bytes), "Received invalid Bencode message.");
-                    }
-                };
-            }
-            Ok((_, SocketAddr::V6(_))) => {
-                // Ignore unsupported Ipv6 messages
-            }
+        let (from, len, stride) = match self.io.recv_batch().await {
+            Ok(received) => received,
             Err(error) => {
-                warn!("IO error {error}")
+                warn!("IO error {error}");
+                return Vec::new();
             }
         };
+        let SocketAddr::V4(from) = from else {
+            // Ignore unsupported Ipv6 messages
+            return Vec::new();
+        };
+        // Taken out so each datagram can be handled with `&mut self`.
+        let batch = std::mem::take(&mut self.io.batch);
+        let stride = if stride == 0 { len.max(1) } else { stride };
+        let messages = batch[..len]
+            .chunks(stride)
+            .filter_map(|bytes| self.handle_datagram(bytes, from))
+            .collect();
+        self.io.batch = batch;
+        messages
+    }
 
+    /// Passes one datagram to the hook, or parses it as a KRPC message.
+    fn handle_datagram(
+        &mut self,
+        bytes: &[u8],
+        from: SocketAddrV4,
+    ) -> Option<(Message, SocketAddrV4)> {
+        if from.port() == 0 {
+            trace!(
+                context = "socket_validation",
+                message = "Response from port 0"
+            );
+            return None;
+        }
+
+        if self
+            .datagram_hook
+            .as_mut()
+            .is_some_and(|hook| hook.accept(bytes, from))
+        {
+            return None;
+        }
+
+        match Message::from_bytes(bytes) {
+            Ok(message) => {
+                // Parsed correctly.
+                let should_return = match message.message_type {
+                    MessageType::Request(ref _request_specific) => {
+                        // simulate legacy nodes not supporting `announce_signed_peers` and `get_signed_peers`
+                        #[cfg(test)]
+                        let should_return = supports_request(&self.version, _request_specific);
+                        #[cfg(not(test))]
+                        let should_return = true;
+
+                        trace!(
+                            context = "socket_message_receiving",
+                            ?message,
+                            ?from,
+                            "Received request message"
+                        );
+
+                        should_return
+                    }
+                    MessageType::Response(_) => {
+                        trace!(
+                            context = "socket_message_receiving",
+                            ?message,
+                            ?from,
+                            "Received response message"
+                        );
+
+                        self.is_expected_response(&message, &from)
+                    }
+                    MessageType::Error(_) => {
+                        trace!(
+                            context = "socket_message_receiving",
+                            ?message,
+                            ?from,
+                            "Received error message"
+                        );
+
+                        self.is_expected_response(&message, &from)
+                    }
+                };
+
+                if should_return {
+                    return Some((message, from));
+                }
+            }
+            Err(error) => {
+                trace!(context = "socket_error", ?error, ?from, message = ?String::from_utf8_lossy(bytes), "Received invalid Bencode message.");
+            }
+        };
         None
     }
 
@@ -714,7 +702,7 @@ mod test {
         client.flush().await;
 
         let (message, from) = loop {
-            if let Some(result) = server.recv_from().await {
+            if let Some(result) = server.recv_batch().await.into_iter().next() {
                 break result;
             }
         };
@@ -746,7 +734,7 @@ mod test {
         );
         client.flush().await;
 
-        assert!(server.recv_from().await.is_none());
+        assert!(server.recv_batch().await.is_empty());
         let (bytes, _) = receiver.recv().await.unwrap();
         assert!(Message::from_bytes(&bytes).is_ok());
     }
@@ -772,7 +760,7 @@ mod test {
         client.flush().await;
 
         let (message, from) = loop {
-            if let Some(result) = server.recv_from().await {
+            if let Some(result) = server.recv_batch().await.into_iter().next() {
                 break result;
             }
         };
@@ -812,10 +800,10 @@ mod test {
         client.flush().await;
 
         // Use a timeout to avoid hanging - recv should not return a valid response
-        let result = tokio::time::timeout(Duration::from_millis(50), server.recv_from()).await;
+        let result = tokio::time::timeout(Duration::from_millis(50), server.recv_batch()).await;
 
         assert!(
-            result.is_err() || result.unwrap().is_none(),
+            result.is_err() || result.unwrap().is_empty(),
             "Should not receive a response from wrong address"
         );
     }
@@ -866,15 +854,20 @@ mod test {
                 sender.send_to(datagram, destination).unwrap();
             }
         }
-        let mut buf = [0u8; MTU];
-        for expected in &datagrams {
-            let (len, from) =
-                tokio::time::timeout(Duration::from_secs(5), receiver.recv_from(&mut buf))
+        let mut received = Vec::new();
+        while received.len() < datagrams.len() {
+            let (from, len, stride) =
+                tokio::time::timeout(Duration::from_secs(5), receiver.recv_batch())
                     .await
-                    .expect("datagram in time")
+                    .expect("datagrams in time")
                     .unwrap();
             assert_eq!(from, sender.local_addr().unwrap());
-            assert_eq!(&buf[..len], &expected[..]);
+            received.extend(
+                receiver.batch[..len]
+                    .chunks(stride.max(1))
+                    .map(<[u8]>::to_vec),
+            );
         }
+        assert_eq!(received, datagrams);
     }
 }
