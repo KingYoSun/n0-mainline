@@ -25,6 +25,12 @@ const DEFAULT_PORT: u16 = 6881;
 
 const MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Most requests awaiting answers before lookups wait to send more.
+const MAX_INFLIGHT_REQUESTS: usize = 1024;
+
+/// Most requests kept, including timed out ones whose answers may still come.
+const MAX_TRACKED_REQUESTS: usize = 2 * MAX_INFLIGHT_REQUESTS;
+
 /// Version before supporting `announce_signed_peers`
 #[cfg(test)]
 const LEGACY_VERSION: [u8; 4] = [82, 83, 0, 5]; // "RS" version 05
@@ -242,6 +248,18 @@ impl KrpcSocket {
         self.inflight_requests.get(*transaction_id).is_some()
     }
 
+    /// Returns true if a lookup may send another request now.
+    pub(crate) fn has_request_capacity(&self) -> bool {
+        self.inflight_requests.awaiting() < MAX_INFLIGHT_REQUESTS
+    }
+
+    /// Stops awaiting answers to these requests, so that their answers are ignored.
+    pub(crate) fn forget(&mut self, transaction_ids: &[u32]) {
+        self.inflight_requests
+            .requests
+            .retain(|request| !transaction_ids.contains(&request.tid));
+    }
+
     /// Send a request to the given address and return the transaction_id.
     /// The packet is queued; call [`Self::flush`] to actually send.
     pub fn request(&mut self, address: SocketAddrV4, request: RequestSpecific) -> u32 {
@@ -307,8 +325,6 @@ impl KrpcSocket {
     /// same sender, and all of them are handled. Cancel safe: everything after
     /// the receive itself is synchronous.
     pub async fn recv_batch(&mut self) -> Vec<(Message, SocketAddrV4)> {
-        self.inflight_requests.cleanup();
-
         let (from, len, stride) = match self.io.recv_batch().await {
             Ok(received) => received,
             Err(error) => {
@@ -515,7 +531,7 @@ impl Debug for InflightRequest {
     }
 }
 
-/// We don't need a map, since we know the maximum size is `65536` requests.
+/// We don't need a map, since there are at most [`MAX_TRACKED_REQUESTS`] requests.
 /// Requests are also ordered by their transaction_id and thus sent_at, so lookup is fast.
 struct InflightRequests {
     next_tid: u32,
@@ -559,7 +575,16 @@ impl InflightRequests {
     }
 
     /// Adds a [InflightRequest] with new transaction_id, and returns that id.
+    ///
+    /// When the table is full, the requests that timed out make room, or the
+    /// oldest ones if none did.
     fn add(&mut self, to: SocketAddrV4) -> u32 {
+        if self.requests.len() >= MAX_TRACKED_REQUESTS {
+            let index = self
+                .first_awaiting()
+                .max(self.requests.len() + 1 - MAX_TRACKED_REQUESTS);
+            self.requests.drain(0..index);
+        }
         let tid = self.tid();
         self.requests.push(InflightRequest {
             tid,
@@ -614,21 +639,23 @@ impl InflightRequests {
             .binary_search_by(|request| request.tid.cmp(&tid))
     }
 
-    /// Removes timeedout requests if necessary to save memory
-    fn cleanup(&mut self) {
-        if self.requests.len() < self.requests.capacity() {
-            return;
-        }
+    /// Returns how many requests have not timed out yet.
+    ///
+    /// Timed out ones stay until the table is full, so that an answer that
+    /// comes late still counts.
+    fn awaiting(&self) -> usize {
+        self.requests.len() - self.first_awaiting()
+    }
 
-        let index = match self
+    /// Returns the index of the first request that has not timed out.
+    fn first_awaiting(&self) -> usize {
+        match self
             .requests
             .binary_search_by(|request| self.request_timeout().cmp(&request.sent_at.elapsed()))
         {
             Ok(index) => index,
             Err(index) => index,
-        };
-
-        self.requests.drain(0..index);
+        }
     }
 }
 
@@ -833,6 +860,33 @@ mod test {
         tokio::time::sleep(server.inflight_requests.request_timeout()).await;
 
         assert!(!server.inflight(&tid));
+    }
+
+    /// The table of requests keeps a fixed size however many requests were
+    /// sent: timed out requests make room first, then the oldest ones.
+    #[test]
+    fn requests_kept_stay_within_the_limit() {
+        let mut requests = InflightRequests::new();
+        let to = SocketAddrV4::new([127, 0, 0, 1].into(), 1);
+        for _ in 0..MAX_TRACKED_REQUESTS {
+            requests.add(to);
+        }
+        let timed_out = Instant::now() - Duration::from_secs(60);
+        for request in &mut requests.requests[..10] {
+            request.sent_at = timed_out;
+        }
+        requests.add(to);
+        assert_eq!(requests.requests.len(), MAX_TRACKED_REQUESTS - 9);
+
+        for _ in 0..4 * MAX_TRACKED_REQUESTS {
+            requests.add(to);
+        }
+        assert_eq!(requests.requests.len(), MAX_TRACKED_REQUESTS);
+        assert!(requests.requests.capacity() <= 2 * MAX_TRACKED_REQUESTS);
+        assert_eq!(
+            requests.requests[0].tid,
+            requests.next_tid - MAX_TRACKED_REQUESTS as u32
+        );
     }
 
     /// Datagrams that arrive in one GRO batch are handed out one by one.

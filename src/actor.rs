@@ -23,6 +23,17 @@ use socket::{DatagramHook, KrpcSocket};
 
 pub use info::Info;
 
+/// Most lookups with receivers at once. Lookups the node runs for itself, to
+/// bootstrap or to find where to store, do not count.
+const MAX_LOOKUPS: usize = 256;
+/// Most receivers of one lookup.
+const MAX_RECEIVERS: usize = 64;
+
+/// Identifies one receiver of a lookup.
+pub(crate) type ReceiverId = u64;
+/// A receiver withdrawn from the lookup of a target.
+pub(crate) type Cancel = (Id, ReceiverId);
+
 #[derive(Debug)]
 /// Internal Rpc called in the Dht thread loop, useful to create your own actor setup.
 pub(crate) struct Actor {
@@ -30,12 +41,17 @@ pub(crate) struct Actor {
     core: Core,
 
     put_senders: HashMap<Id, Vec<oneshot::Sender<Result<Id, PutError>>>>,
-    get_senders: HashMap<Id, Vec<ResponseSender>>,
+    get_senders: HashMap<Id, Vec<(ReceiverId, ResponseSender)>>,
+    /// Each dropped receiver sends at most one, so this holds at most as many as there are receivers.
+    cancels: mpsc::UnboundedReceiver<Cancel>,
 }
 
 impl Actor {
     /// Create a new actor
-    pub(crate) fn new(config: config::Config) -> io::Result<Self> {
+    pub(crate) fn new(
+        config: config::Config,
+        cancels: mpsc::UnboundedReceiver<Cancel>,
+    ) -> io::Result<Self> {
         let id = if let Some(ip) = config.public_ip {
             Id::from_ip(ip.into())
         } else {
@@ -68,6 +84,7 @@ impl Actor {
 
             put_senders: HashMap::new(),
             get_senders: HashMap::new(),
+            cancels,
         })
     }
 
@@ -104,6 +121,11 @@ impl Actor {
     /// maintain the routing table, and everything else that needs
     /// to happen at every tick.
     fn tick(&mut self) {
+        // Withdrawn receivers first, so that their lookups send nothing more.
+        while let Ok(cancel) = self.cancels.try_recv() {
+            self.cancel(cancel);
+        }
+
         self.periodic_node_maintaenance();
 
         let mut done_put_queries = self.check_done_put_queries();
@@ -127,7 +149,7 @@ impl Actor {
         // Cleanup done iterative queries
         for (id, closest_nodes) in done_iterative_queries {
             if let Some(senders) = self.get_senders.remove(&id) {
-                for sender in senders {
+                for (_, sender) in senders {
                     // return closest_nodes to whoever was asking
                     if let ResponseSender::ClosestNodes(sender) = sender {
                         let _ = sender.send(closest_nodes.clone());
@@ -160,9 +182,56 @@ impl Actor {
         if let Some((target, response)) = new_query_response
             && let Some(senders) = self.get_senders.get_mut(&target)
         {
-            for sender in senders.iter_mut() {
+            for (_, sender) in senders.iter_mut() {
                 send(sender, response.clone());
             }
+        }
+    }
+
+    /// Adds a receiver to the lookup of the request's target, starting the lookup
+    /// if needed, or refuses it beyond the limits.
+    fn subscribe(
+        &mut self,
+        request: GetRequestSpecific,
+        mut sender: ResponseSender,
+        receiver: ReceiverId,
+    ) {
+        let target = request.target();
+        let receivers = self.get_senders.get(&target).map_or(0, Vec::len);
+        // A receiver dropped before its request arrived is not added.
+        if sender.is_closed()
+            || receivers >= MAX_RECEIVERS
+            || (receivers == 0 && self.get_senders.len() >= MAX_LOOKUPS)
+        {
+            sender.refuse();
+            return;
+        }
+
+        for response in self.get(request, None) {
+            send(&mut sender, response);
+        }
+        self.get_senders
+            .entry(target)
+            .or_default()
+            .push((receiver, sender));
+    }
+
+    /// Withdraws a receiver. Without receivers left, the lookup ends, unless the
+    /// node runs it for itself: to bootstrap, or to find where to store.
+    fn cancel(&mut self, (target, receiver): Cancel) {
+        let Some(senders) = self.get_senders.get_mut(&target) else {
+            return;
+        };
+        senders.retain(|(id, _)| *id != receiver);
+        if !senders.is_empty() {
+            return;
+        }
+        self.get_senders.remove(&target);
+        if target == *self.id() || self.core.put_queries.contains_key(&target) {
+            return;
+        }
+        if let Some(query) = self.core.iterative_queries.remove(&target) {
+            self.socket.forget(query.inflight_requests());
         }
     }
 
@@ -233,6 +302,9 @@ impl Actor {
             }
 
             for address in to_visit {
+                if !self.socket.has_request_capacity() {
+                    break;
+                }
                 query.visit(&mut self.socket, address);
             }
 
@@ -423,16 +495,8 @@ pub(crate) async fn run(mut actor: Actor, mut receiver: mpsc::Receiver<ActorMess
                                 }
                             };
                         }
-                        ActorMessage::Get(request, mut sender) => {
-                            let target = request.target();
-
-                            let responses = actor.get(request, None);
-                            for response in responses {
-                                send(&mut sender, response);
-                            }
-
-                            let senders = actor.get_senders.entry(target).or_default();
-                            senders.push(sender);
+                        ActorMessage::Get(request, sender, receiver) => {
+                            actor.subscribe(request, sender, receiver);
                         }
                         ActorMessage::ToBootstrap(sender) => {
                             let _ = sender.send(actor.to_bootstrap());
@@ -456,6 +520,9 @@ pub(crate) async fn run(mut actor: Actor, mut receiver: mpsc::Receiver<ActorMess
                     actor.process_message(message, from);
                 }
             }
+            Some(cancel) = actor.cancels.recv() => {
+                actor.cancel(cancel);
+            }
             _ = maintenance.tick() => {
                 // Wake the loop so actor.tick() runs even when idle,
                 // ensuring routing table refresh and node pings happen on schedule.
@@ -466,16 +533,18 @@ pub(crate) async fn run(mut actor: Actor, mut receiver: mpsc::Receiver<ActorMess
     }
 }
 
+/// Hands an answer to a receiver. A receiver that holds as many unread answers
+/// as it can does not get this one.
 fn send(sender: &mut ResponseSender, response: Response) {
     match (sender, response) {
         (ResponseSender::Peers(s), Response::Peers(r)) => {
-            let _ = s.send(r);
+            let _ = s.try_send(r);
         }
         (ResponseSender::SignedPeers(s), Response::SignedPeers(r)) => {
-            let _ = s.send(r);
+            let _ = s.try_send(r);
         }
         (ResponseSender::Mutable(s), Response::Mutable(r)) => {
-            let _ = s.send(r);
+            let _ = s.try_send(r);
         }
         (ResponseSender::Immutable(s), Response::Immutable(r)) => {
             if let Some(tx) = s.take() {
@@ -494,7 +563,7 @@ pub(crate) enum ActorMessage {
         oneshot::Sender<Result<Id, PutError>>,
         Option<Box<[Node]>>,
     ),
-    Get(GetRequestSpecific, ResponseSender),
+    Get(GetRequestSpecific, ResponseSender, ReceiverId),
     ToBootstrap(oneshot::Sender<Vec<String>>),
     SetDatagramHook(Option<DatagramHook>),
     SendDatagram(Vec<u8>, SocketAddrV4),
@@ -504,9 +573,29 @@ pub(crate) enum ActorMessage {
 #[derive(Debug)]
 pub(crate) enum ResponseSender {
     ClosestNodes(oneshot::Sender<Box<[Node]>>),
-    Peers(mpsc::UnboundedSender<Vec<SocketAddrV4>>),
+    Peers(mpsc::Sender<Vec<SocketAddrV4>>),
     #[allow(dead_code)]
-    SignedPeers(mpsc::UnboundedSender<Vec<SignedAnnounce>>),
-    Mutable(mpsc::UnboundedSender<MutableItem>),
+    SignedPeers(mpsc::Sender<Vec<SignedAnnounce>>),
+    Mutable(mpsc::Sender<MutableItem>),
     Immutable(Option<oneshot::Sender<Box<[u8]>>>),
+}
+
+impl ResponseSender {
+    /// Returns true if the caller is gone.
+    fn is_closed(&self) -> bool {
+        match self {
+            ResponseSender::ClosestNodes(s) => s.is_closed(),
+            ResponseSender::Peers(s) => s.is_closed(),
+            ResponseSender::SignedPeers(s) => s.is_closed(),
+            ResponseSender::Mutable(s) => s.is_closed(),
+            ResponseSender::Immutable(s) => s.as_ref().is_none_or(|s| s.is_closed()),
+        }
+    }
+
+    /// Ends the call as if its lookup found nothing.
+    fn refuse(self) {
+        if let ResponseSender::ClosestNodes(s) = self {
+            let _ = s.send(Box::new([]));
+        }
+    }
 }
