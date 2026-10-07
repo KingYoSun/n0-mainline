@@ -13,6 +13,10 @@ use crate::common::{FindNodeRequestArguments, GetPeersRequestArguments, GetValue
 use crate::common::{Id, MAX_BUCKET_SIZE_K, Node, RequestSpecific, RequestTypeSpecific};
 use crate::core::Response;
 
+/// Most answers held for a receiver that has not read them yet. A receiver that
+/// joins a lookup later gets this many of the earlier answers at most.
+pub(crate) const MAX_HELD_ANSWERS: usize = 16;
+
 /// An iterative process of concurrently sending a request to the closest known nodes to
 /// the target, updating the routing table with closer nodes discovered in the responses, and
 /// repeating this process until no closer nodes (that aren't already queried) are found.
@@ -126,6 +130,11 @@ impl IterativeQuery {
         &self.responses
     }
 
+    /// Transaction ids of the requests this query sent.
+    pub fn inflight_requests(&self) -> &[u32] {
+        &self.inflight_requests
+    }
+
     pub fn best_address(&self) -> Option<SocketAddrV4> {
         let mut max = 0_u32;
         let mut best_addr = None;
@@ -180,13 +189,20 @@ impl IterativeQuery {
 
         trace!(?target, ?response, ?from, "Query got response");
 
-        self.responses.push(response.to_owned());
+        if self.responses.len() < MAX_HELD_ANSWERS {
+            self.responses.push(response.to_owned());
+        }
     }
 
+    /// Visits the closest nodes not visited yet, as far as the socket has room
+    /// for more requests. The others wait for a later tick.
     pub fn visit_closest(&mut self, socket: &mut KrpcSocket) {
         let to_visit = self.closest_candidates();
 
         for address in to_visit {
+            if !socket.has_request_capacity() {
+                break;
+            }
             self.visit(socket, address);
         }
     }
@@ -204,11 +220,12 @@ impl IterativeQuery {
     /// Returns true if it is done.
     pub fn is_done(&self, socket: &KrpcSocket) -> bool {
         // If no more inflight_requests are inflight in the socket (not timed out),
-        // then the query is done.
+        // and no closer node waits for room to send a request, then the query is done.
         let done = !self
             .inflight_requests
             .iter()
-            .any(|&tid| socket.inflight(&tid));
+            .any(|&tid| socket.inflight(&tid))
+            && self.closest_candidates().is_empty();
 
         if done {
             debug!(id=?self.target(), closest = ?self.closest.len(), visited = ?self.visited.len(), responders = ?self.responders.len(), "Done query");

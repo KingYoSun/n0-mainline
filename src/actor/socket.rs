@@ -25,6 +25,9 @@ const DEFAULT_PORT: u16 = 6881;
 
 const MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Most requests awaiting answers before lookups wait to send more.
+const MAX_INFLIGHT_REQUESTS: usize = 1024;
+
 /// Version before supporting `announce_signed_peers`
 #[cfg(test)]
 const LEGACY_VERSION: [u8; 4] = [82, 83, 0, 5]; // "RS" version 05
@@ -240,6 +243,19 @@ impl KrpcSocket {
     /// Returns true if this message's transaction_id is still inflight
     pub fn inflight(&self, transaction_id: &u32) -> bool {
         self.inflight_requests.get(*transaction_id).is_some()
+    }
+
+    /// Returns true if a lookup may send another request now.
+    pub(crate) fn has_request_capacity(&mut self) -> bool {
+        self.inflight_requests.cleanup();
+        self.inflight_requests.requests.len() < MAX_INFLIGHT_REQUESTS
+    }
+
+    /// Stops awaiting answers to these requests, so that their answers are ignored.
+    pub(crate) fn forget(&mut self, transaction_ids: &[u32]) {
+        self.inflight_requests
+            .requests
+            .retain(|request| !transaction_ids.contains(&request.tid));
     }
 
     /// Send a request to the given address and return the transaction_id.
@@ -614,12 +630,8 @@ impl InflightRequests {
             .binary_search_by(|request| request.tid.cmp(&tid))
     }
 
-    /// Removes timeedout requests if necessary to save memory
+    /// Removes timed out requests.
     fn cleanup(&mut self) {
-        if self.requests.len() < self.requests.capacity() {
-            return;
-        }
-
         let index = match self
             .requests
             .binary_search_by(|request| self.request_timeout().cmp(&request.sent_at.elapsed()))

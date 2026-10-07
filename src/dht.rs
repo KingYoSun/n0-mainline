@@ -3,6 +3,7 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 #[allow(unused_imports)]
@@ -13,14 +14,20 @@ use tokio::sync::{mpsc, oneshot};
 #[allow(unused_imports)]
 use crate::{
     Node, ServerSettings,
-    actor::{ActorMessage, Info, ResponseSender, config::Config, socket::DatagramHook},
+    actor::{
+        ActorMessage, Cancel, Info, ReceiverId, ResponseSender, config::Config,
+        socket::DatagramHook,
+    },
     common::{
         AnnouncePeerRequestArguments, AnnounceSignedPeerRequestArguments, FindNodeRequestArguments,
         GetPeersRequestArguments, GetValueRequestArguments, Id, MutableItem,
         PutImmutableRequestArguments, PutMutableRequestArguments, PutRequestSpecific,
         SignedAnnounce, hash_immutable,
     },
-    core::{ConcurrencyError, PutError, PutQueryError, iterative_query::GetRequestSpecific},
+    core::{
+        ConcurrencyError, PutError, PutQueryError,
+        iterative_query::{GetRequestSpecific, MAX_HELD_ANSWERS},
+    },
 };
 
 #[cfg(test)]
@@ -49,7 +56,20 @@ impl From<ActorShutdown> for io::Error {
 
 #[derive(Debug, Clone)]
 /// Mainline Dht node.
-pub struct Dht(pub(crate) mpsc::Sender<ActorMessage>);
+///
+/// Calls that look something up share one lookup per target. A call that
+/// stops waiting, or drops its [GetStream], withdraws from the lookup, which
+/// stops once no call is left, unless the node needs it itself: to bootstrap,
+/// or to find where to store.
+///
+/// A node runs up to 256 lookups with waiting calls at once, each with up to
+/// 64 calls, and has up to 1024 requests awaiting answers before lookups wait
+/// to send more. A call beyond these limits gets no answer: an empty stream,
+/// no nodes, or no value.
+pub struct Dht(
+    pub(crate) mpsc::Sender<ActorMessage>,
+    mpsc::UnboundedSender<Cancel>,
+);
 
 #[derive(Debug, Default, Clone)]
 /// A builder for the [Dht] node.
@@ -139,10 +159,11 @@ impl Dht {
     /// Must be called from within a Tokio runtime context: the socket is registered
     /// with the Tokio reactor here, and the actor loop is spawned as a background task.
     pub fn new(config: Config) -> io::Result<Self> {
-        let actor = crate::actor::Actor::new(config)?;
+        let (cancel_sender, cancels) = mpsc::unbounded_channel();
+        let actor = crate::actor::Actor::new(config, cancels)?;
         let (sender, receiver) = mpsc::channel(ACTOR_INBOX_CAPACITY);
         tokio::spawn(crate::actor::run(actor, receiver));
-        Ok(Dht(sender))
+        Ok(Dht(sender, cancel_sender))
     }
 
     /// Returns a builder to edit settings before creating a Dht node.
@@ -240,13 +261,13 @@ impl Dht {
     /// use [Self::get_closest_nodes] instead.
     pub async fn find_node(&self, target: Id) -> Result<Box<[Node]>, ActorShutdown> {
         let (tx, rx) = oneshot::channel();
-        self.send(ActorMessage::Get(
+        self.get_once(
             GetRequestSpecific::FindNode(FindNodeRequestArguments { target }),
             ResponseSender::ClosestNodes(tx),
-        ))
-        .await?;
-
-        rx.await.map_err(|_| ActorShutdown)
+            rx,
+        )
+        .await?
+        .ok_or(ActorShutdown)
     }
 
     // === Peers ===
@@ -260,18 +281,17 @@ impl Dht {
     /// for Bittorrent is that any peer will introduce you to more peers through "peer exchange"
     /// so if you are implementing something different from Bittorrent, you might want
     /// to implement your own logic for gossipping more peers after you discover the first ones.
+    ///
+    /// See [GetStream] for how many answers it holds and what dropping it does.
     pub async fn get_peers(
         &self,
         info_hash: Id,
     ) -> Result<GetStream<Vec<SocketAddrV4>>, ActorShutdown> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.send(ActorMessage::Get(
+        self.get_stream(
             GetRequestSpecific::GetPeers(GetPeersRequestArguments { info_hash }),
-            ResponseSender::Peers(tx),
-        ))
-        .await?;
-
-        Ok(GetStream(rx))
+            ResponseSender::Peers,
+        )
+        .await
     }
 
     /// Announce a peer for a given infohash.
@@ -363,14 +383,11 @@ impl Dht {
         &self,
         info_hash: Id,
     ) -> Result<GetStream<Vec<SignedAnnounce>>, ActorShutdown> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.send(ActorMessage::Get(
+        self.get_stream(
             GetRequestSpecific::GetSignedPeers(GetPeersRequestArguments { info_hash }),
-            ResponseSender::SignedPeers(tx),
-        ))
-        .await?;
-
-        Ok(GetStream(rx))
+            ResponseSender::SignedPeers,
+        )
+        .await
     }
 
     // === Immutable data ===
@@ -378,18 +395,17 @@ impl Dht {
     /// Get an Immutable data by its sha1 hash.
     pub async fn get_immutable(&self, target: Id) -> Result<Option<Box<[u8]>>, ActorShutdown> {
         let (tx, rx) = oneshot::channel();
-        self.send(ActorMessage::Get(
+        // Sender dropped without sending → query completed without finding a value.
+        self.get_once(
             GetRequestSpecific::GetValue(GetValueRequestArguments {
                 target,
                 seq: None,
                 salt: None,
             }),
             ResponseSender::Immutable(Some(tx)),
-        ))
-        .await?;
-
-        // Sender dropped without sending → query completed without finding a value.
-        Ok(rx.await.ok())
+            rx,
+        )
+        .await
     }
 
     /// Put an immutable data to the DHT.
@@ -429,18 +445,15 @@ impl Dht {
     ) -> Result<GetStream<MutableItem>, ActorShutdown> {
         let salt = salt.map(|s| s.into());
         let target = MutableItem::target_from_key(public_key, salt.as_deref());
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.send(ActorMessage::Get(
+        self.get_stream(
             GetRequestSpecific::GetValue(GetValueRequestArguments {
                 target,
                 seq: more_recent_than,
                 salt,
             }),
-            ResponseSender::Mutable(tx),
-        ))
-        .await?;
-
-        Ok(GetStream(rx))
+            ResponseSender::Mutable,
+        )
+        .await
     }
 
     /// Get the most recent [MutableItem] from the network.
@@ -452,7 +465,8 @@ impl Dht {
         let mut most_recent: Option<MutableItem> = None;
         let mut stream = self.get_mutable(public_key, salt, None).await?;
 
-        while let Some(item) = stream.0.recv().await {
+        while let Some(item) = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await
+        {
             if let Some(mr) = &most_recent {
                 if item.seq() == mr.seq && item.value() > &*mr.value {
                     most_recent = Some(item)
@@ -536,17 +550,17 @@ impl Dht {
     /// [PutRequestSpecific::target]. Which itself is useful to circumvent [extreme vertical sybil attacks](https://github.com/nuhvi/mainline/blob/main/docs/censorship-resistance.md#extreme-vertical-sybil-attacks).
     pub async fn get_closest_nodes(&self, target: Id) -> Result<Box<[Node]>, ActorShutdown> {
         let (tx, rx) = oneshot::channel();
-        self.send(ActorMessage::Get(
+        self.get_once(
             GetRequestSpecific::GetValue(GetValueRequestArguments {
                 target,
                 salt: None,
                 seq: None,
             }),
             ResponseSender::ClosestNodes(tx),
-        ))
-        .await?;
-
-        rx.await.map_err(|_| ActorShutdown)
+            rx,
+        )
+        .await?
+        .ok_or(ActorShutdown)
     }
 
     /// Send a PUT request to the closest nodes, and optionally some extra nodes.
@@ -575,6 +589,76 @@ impl Dht {
     async fn send(&self, message: ActorMessage) -> Result<(), ActorShutdown> {
         self.0.send(message).await.map_err(|_| ActorShutdown)
     }
+
+    fn subscribe(&self, target: Id) -> Subscription {
+        static RECEIVERS: AtomicU64 = AtomicU64::new(0);
+        Subscription {
+            target,
+            receiver: RECEIVERS.fetch_add(1, Ordering::Relaxed),
+            cancels: Some(self.1.clone()),
+        }
+    }
+
+    /// Runs a lookup for a stream of answers.
+    async fn get_stream<T>(
+        &self,
+        request: GetRequestSpecific,
+        sender: impl FnOnce(mpsc::Sender<T>) -> ResponseSender,
+    ) -> Result<GetStream<T>, ActorShutdown> {
+        let (tx, answers) = mpsc::channel(MAX_HELD_ANSWERS);
+        let subscription = self.subscribe(request.target());
+        self.send(ActorMessage::Get(
+            request,
+            sender(tx),
+            subscription.receiver,
+        ))
+        .await?;
+
+        Ok(GetStream {
+            answers,
+            subscription,
+        })
+    }
+
+    /// Runs a lookup for one answer, and withdraws from it if the caller stops
+    /// waiting. Returns `None` if the answer's sender was dropped without one.
+    async fn get_once<T>(
+        &self,
+        request: GetRequestSpecific,
+        sender: ResponseSender,
+        answer: oneshot::Receiver<T>,
+    ) -> Result<Option<T>, ActorShutdown> {
+        let mut subscription = self.subscribe(request.target());
+        self.send(ActorMessage::Get(request, sender, subscription.receiver))
+            .await?;
+        let answer = answer.await.ok();
+        subscription.finish();
+
+        Ok(answer)
+    }
+}
+
+/// A receiver's place in a lookup, given up when dropped before the lookup ends.
+#[derive(Debug)]
+struct Subscription {
+    target: Id,
+    receiver: ReceiverId,
+    cancels: Option<mpsc::UnboundedSender<Cancel>>,
+}
+
+impl Subscription {
+    /// The lookup ended, so there is nothing to give up.
+    fn finish(&mut self) {
+        self.cancels = None;
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(cancels) = self.cancels.take() {
+            let _ = cancels.send((self.target, self.receiver));
+        }
+    }
 }
 
 fn put_error_to_query_error(error: PutError) -> PutQueryError {
@@ -587,14 +671,25 @@ fn put_error_to_query_error(error: PutError) -> PutQueryError {
 }
 
 /// A [Stream] of incoming peers, immutable or mutable values.
-pub struct GetStream<T>(mpsc::UnboundedReceiver<T>);
+///
+/// It holds up to 16 answers that were not read yet, and misses the answers
+/// that arrive while it is full. Dropping it withdraws it from its lookup, as
+/// described on [Dht].
+pub struct GetStream<T> {
+    answers: mpsc::Receiver<T>,
+    subscription: Subscription,
+}
 
 impl<T> Stream for GetStream<T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        this.0.poll_recv(cx)
+        let answer = this.answers.poll_recv(cx);
+        if let Poll::Ready(None) = answer {
+            this.subscription.finish();
+        }
+        answer
     }
 }
 
