@@ -246,9 +246,8 @@ impl KrpcSocket {
     }
 
     /// Returns true if a lookup may send another request now.
-    pub(crate) fn has_request_capacity(&mut self) -> bool {
-        self.inflight_requests.cleanup();
-        self.inflight_requests.requests.len() < MAX_INFLIGHT_REQUESTS
+    pub(crate) fn has_request_capacity(&self) -> bool {
+        self.inflight_requests.awaiting() < MAX_INFLIGHT_REQUESTS
     }
 
     /// Stops awaiting answers to these requests, so that their answers are ignored.
@@ -630,17 +629,33 @@ impl InflightRequests {
             .binary_search_by(|request| request.tid.cmp(&tid))
     }
 
-    /// Removes timed out requests.
+    /// Removes timeedout requests if necessary to save memory
     fn cleanup(&mut self) {
-        let index = match self
+        if self.requests.len() < self.requests.capacity() {
+            return;
+        }
+
+        let index = self.first_awaiting();
+        self.requests.drain(0..index);
+    }
+
+    /// Returns how many requests have not timed out yet.
+    ///
+    /// Timed out ones stay until [`Self::cleanup`], so that an answer that
+    /// comes late still counts.
+    fn awaiting(&self) -> usize {
+        self.requests.len() - self.first_awaiting()
+    }
+
+    /// Returns the index of the first request that has not timed out.
+    fn first_awaiting(&self) -> usize {
+        match self
             .requests
             .binary_search_by(|request| self.request_timeout().cmp(&request.sent_at.elapsed()))
         {
             Ok(index) => index,
             Err(index) => index,
-        };
-
-        self.requests.drain(0..index);
+        }
     }
 }
 

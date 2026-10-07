@@ -327,7 +327,68 @@ async fn requests_awaiting_answers_stay_within_the_limit() {
 
     let waiting = requests(&silent);
     assert!(
-        (1..=1024).contains(&waiting),
+        waiting <= 1024,
         "{waiting} requests awaited answers at once"
     );
+    // The lookups had more to send, which goes out as earlier requests time out.
+    wait_for(|| requests(&silent) == 64 * 20).await;
+}
+
+/// An answer that comes after its request timed out still counts while the
+/// lookup goes on.
+#[tokio::test]
+async fn a_late_answer_counts_while_the_lookup_goes_on() {
+    let target = Id::random();
+    let mut sockets = Vec::new();
+    for _ in 0..6 {
+        sockets.push(bind().await);
+    }
+    let (holder_socket, holder_addr) = bind().await;
+    let holder = Node::new(closer(target, 10), holder_addr);
+    let addrs: Vec<SocketAddrV4> = sockets.iter().map(|(_, addr)| *addr).collect();
+    // A line of nodes that keeps the lookup going for about two seconds; the
+    // first one also tells about the holder.
+    let mut _line = Vec::new();
+    for (hop, (socket, addr)) in sockets.into_iter().enumerate() {
+        let mut nodes: Vec<Node> = addrs
+            .get(hop + 1)
+            .map(|next| Node::new(closer(target, hop + 1), *next))
+            .into_iter()
+            .collect();
+        if hop == 0 {
+            nodes.push(holder.clone());
+        }
+        let answer: Answer = Arc::new(move |_| (vec![], nodes.clone()));
+        _line.push(serve(
+            socket,
+            addr,
+            closer(target, hop),
+            Duration::from_millis(300),
+            Some(answer),
+        ));
+    }
+    // The holder answers after the client's request timeout of 500 ms.
+    let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242);
+    let answer: Answer = Arc::new(move |_| (vec![peer], vec![]));
+    let _holder = serve(
+        holder_socket,
+        holder_addr,
+        *holder.id(),
+        Duration::from_millis(700),
+        Some(answer),
+    );
+
+    let dht = client(addrs[0]);
+    let mut peers = dht.get_peers(target).await.unwrap();
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(batch) = peers.next().await {
+            if batch.contains(&peer) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("the lookup ended in time");
+    assert!(found, "the holder's late answer was dropped");
 }
