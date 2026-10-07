@@ -23,6 +23,8 @@ use crate::{
     core::{ConcurrencyError, PutError, PutQueryError, iterative_query::GetRequestSpecific},
 };
 
+#[cfg(test)]
+mod bounds_tests;
 mod testnet;
 
 pub use testnet::Testnet;
